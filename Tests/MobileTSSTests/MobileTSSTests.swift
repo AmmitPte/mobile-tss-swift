@@ -1,0 +1,480 @@
+import Foundation
+import Testing
+
+@testable import MobileTSS
+
+actor TestMemoryBridge {
+    var listeners: [UUID: AsyncStream<Data>.Continuation] = [:]
+
+    func register(id: UUID, continuation: AsyncStream<Data>.Continuation) {
+        listeners[id] = continuation
+    }
+
+    func broadcast(sender: UUID, data: Data) {
+        for (id, continuation) in listeners {
+            if id != sender {
+                continuation.yield(data)
+            }
+        }
+    }
+}
+
+final class BridgeNetworkInterface: NetworkInterface, @unchecked Sendable {
+    let bridge: TestMemoryBridge
+    let id: UUID
+    let stream: AsyncStream<Data>
+    var iterator: AsyncStream<Data>.Iterator
+    var continuation: AsyncStream<Data>.Continuation!
+
+    init(bridge: TestMemoryBridge) {
+        self.bridge = bridge
+        self.id = UUID()
+        var continuation: AsyncStream<Data>.Continuation!
+        self.stream = AsyncStream<Data> { continuation = $0 }
+        self.iterator = self.stream.makeAsyncIterator()
+        self.continuation = continuation
+    }
+
+    func connect() async {
+        await bridge.register(id: self.id, continuation: continuation)
+    }
+
+    func send(data: Data) async throws {
+        await bridge.broadcast(sender: id, data: data)
+    }
+
+    func receive() async throws -> Data {
+        guard let data = await iterator.next() else {
+            throw GeneralError.MessageSendError
+        }
+        return data
+    }
+}
+
+final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
+    var count: Int = 0
+    let lock = NSLock()
+
+    func onSetupChanged(devices: [DeviceInfo], myId: UInt8) {
+        lock.lock()
+        count = devices.count
+        lock.unlock()
+    }
+
+    func getCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+@Test func runDKG() async throws {
+    let instance = InstanceId.fromEntropy()
+    let setupBridge = TestMemoryBridge()
+    let dkgBridge = TestMemoryBridge()
+    let listener = TestSetupListener()
+
+    // Run them
+    let shares = try await withThrowingTaskGroup(of: DeviceLocalData.self) { group in
+        // Create Node 1 (Starter)
+        let node1Setup = BridgeNetworkInterface(bridge: setupBridge)
+        await node1Setup.connect()
+        let node1Dkg = BridgeNetworkInterface(bridge: dkgBridge)
+        await node1Dkg.connect()
+
+        let node1 = DkgNode(
+            name: "Node 1",
+            instance: instance,
+            threshold: 2
+        )
+        node1.addSetupChangeListener(listener: listener)
+
+        let qrBytes = try node1.getQrBytes()
+        let qr = try QrData.fromBytes(bytes: qrBytes)
+
+        // Start Node 1 Task
+        group.addTask {
+            try await node1.messageLoop(setupIf: node1Setup, dkgIf: node1Dkg)
+            return try node1.getLocalData()
+        }
+
+        // Give Node 1 a moment to initialize
+        try await Task.sleep(nanoseconds: 100 * 1_000_000)
+
+        // Create Node 2
+        let node2Setup = BridgeNetworkInterface(bridge: setupBridge)
+        await node2Setup.connect()
+        let node2Dkg = BridgeNetworkInterface(bridge: dkgBridge)
+        await node2Dkg.connect()
+
+        let node2 = DkgNode.fromQr(
+            name: "Node 2",
+            qrData: qr
+        )
+
+        // Start Node 2 Task
+        group.addTask {
+            try await node2.messageLoop(setupIf: node2Setup, dkgIf: node2Dkg)
+            return try node2.getLocalData()
+        }
+
+        // Give Node 2 a moment to connect and send Join
+        try await Task.sleep(nanoseconds: 100 * 1_000_000)
+
+        // Create Node 3
+        let node3Setup = BridgeNetworkInterface(bridge: setupBridge)
+        await node3Setup.connect()
+        let node3Dkg = BridgeNetworkInterface(bridge: dkgBridge)
+        await node3Dkg.connect()
+
+        let node3 = DkgNode.fromQr(
+            name: "Node 3",
+            qrData: qr
+        )
+
+        // Start Node 3 Task
+        group.addTask {
+            try await node3.messageLoop(setupIf: node3Setup, dkgIf: node3Dkg)
+            return try node3.getLocalData()
+        }
+
+        // Wait for all 3 nodes and Node 1 Ready state
+        while true {
+            let count = listener.getCount()
+            let state = node1.getState()
+            if count >= 3 && state == .ready {
+                break
+            }
+            try await Task.sleep(nanoseconds: 100 * 1_000_000)
+        }
+
+        // Start DKG
+        try await node1.startDkg()
+
+        var results: [DeviceLocalData] = []
+        for try await item in group {
+            results.append(item)
+        }
+        return results
+    }
+
+    #expect(shares.count == 3)
+    let firstVk = shares[0].groupVk().toBytes()
+    for s in shares {
+        // s.keyshare().print()
+        #expect(s.groupVk().toBytes() == firstVk)
+        #expect(s.getDeviceList().count == 3)
+        // Verify that we can serialize/deserialize
+        let back = try DeviceLocalData.fromBytes(bytes: s.toBytes())
+        #expect(back.groupVk().toBytes() == firstVk)
+    }
+}
+
+@Test func testSignature() async throws {
+    let data = genLocalData(t: 2, n: 3)
+    let message = "Hello World"
+
+    // Setup network
+    let bridge = TestMemoryBridge()
+    var interfaces: [BridgeNetworkInterface] = []
+
+    for _ in 0..<3 {
+        let net = BridgeNetworkInterface(bridge: bridge)
+        await net.connect()
+        interfaces.append(net)
+    }
+
+    // Helper listener to capture events
+    final class AsyncSignListener: SignRequestListener, SignResultListener, @unchecked Sendable {
+        var reqContinuation: AsyncStream<SignSetupMessage>.Continuation?
+        var resContinuation: AsyncStream<Signature>.Continuation?
+
+        let reqStream: AsyncStream<SignSetupMessage>
+        let resStream: AsyncStream<Signature>
+
+        init() {
+            var reqCont: AsyncStream<SignSetupMessage>.Continuation!
+            self.reqStream = AsyncStream { reqCont = $0 }
+            self.reqContinuation = reqCont
+
+            var resCont: AsyncStream<Signature>.Continuation!
+            self.resStream = AsyncStream { resCont = $0 }
+            self.resContinuation = resCont
+        }
+
+        func receiveSignRequest(req: SignSetupMessage, dev: DeviceInfo?) {
+            reqContinuation?.yield(req)
+        }
+
+        func cancelSignRequest(req: SignSetupMessage) {}
+        func signDevicesChanged(req: SignSetupMessage, devices: [DeviceInfo?]) {}
+        func signDsgStarted(req: SignSetupMessage) {}
+        func signCancelled(req: SignSetupMessage) {}
+
+        func signResult(req: SignSetupMessage, result: Signature) {
+            resContinuation?.yield(result)
+        }
+
+        func signError(req: SignSetupMessage, error: GeneralError) {
+            // print("Sign error: \(error)")
+        }
+
+        func nextRequest() async -> SignSetupMessage? {
+            var iter = reqStream.makeAsyncIterator()
+            return await iter.next()
+        }
+
+        func nextResult() async -> Signature? {
+            var iter = resStream.makeAsyncIterator()
+            return await iter.next()
+        }
+    }
+
+    // Node 0 starts a signature request
+    // We use a TaskGroup to run them all
+    try await withThrowingTaskGroup(of: Signature?.self) { group in
+        // Node 0 (Originator)
+        group.addTask {
+            let node = SignNode(ctx: data[0], netIf: interfaces[0])
+            let listener = AsyncSignListener()
+            node.setRequestListener(listener: listener)
+
+            // Run message loop in background
+            let loopTask = Task {
+                try await node.messageLoop()
+            }
+
+            // Start request
+            _ = try await node.requestSignString(message: message, listener: listener)
+
+            // Wait for result
+            let sig = await listener.nextResult()
+            loopTask.cancel()
+            return sig
+        }
+
+        // Node 1 (Joiner)
+        group.addTask {
+            let node = SignNode(ctx: data[1], netIf: interfaces[1])
+            let listener = AsyncSignListener()
+            node.setRequestListener(listener: listener)
+
+            // Run message loop in background
+            let loopTask = Task {
+                try await node.messageLoop()
+            }
+
+            // Wait for request
+            if let req = await listener.nextRequest() {
+                try await node.acceptRequest(req: req, listener: listener)
+                // Wait for result
+                let sig = await listener.nextResult()
+                loopTask.cancel()
+                return sig
+            }
+            loopTask.cancel()
+            return nil
+        }
+
+        // Node 2 (Joiner) -- Wait we only need threshold 2.
+        // But let's have everyone join or just 2?
+        // If we only run 2, the test should pass.
+
+        // Collect results
+        var sig: Signature? = nil
+        // We expect 2 results
+        for _ in 0..<2 {
+            if let s = try await group.next() {
+                sig = s
+            }
+        }
+
+        #expect(sig != nil)
+        if let sig = sig {
+            try data[0].groupVk().verify(msg: Data(message.utf8), sig: sig)
+        }
+    }
+}
+
+final class NetworkMirror: NetworkInterface, @unchecked Sendable {
+    var buffer: Data?
+
+    init() {
+    }
+
+    func send(data: Data) async throws {
+        print("I sleep.")
+        try await Task.sleep(nanoseconds: 100)
+        print("Sending data: \(data)")
+        buffer = data
+    }
+
+    func receive() async throws -> Data {
+        for _ in 0..<10 {
+            if let b = buffer {
+                let res = b
+                buffer = nil
+                print("Receiving data: \(res)")
+                return res
+            }
+            try await Task.sleep(nanoseconds: 100_000)
+        }
+        throw GeneralError.MessageSendError
+    }
+}
+
+@Test func network_interface_test() async throws {
+    let mirror = NetworkMirror()
+    let tester = NetworkInterfaceTester(interface: mirror)
+    try await tester.test()
+}
+
+final class MockNetworkInterface: NetworkInterface {
+    let send_result: Result<(), GeneralError>
+    let send_delay: UInt64
+    let receive_result: Result<Data, GeneralError>
+    let received_delay: UInt64
+
+    init(
+        send_result: Result<(), GeneralError> = .success(()),
+        send_delay: UInt64 = 0,
+        receive_result: Result<Data, GeneralError> = .success(Data()),
+        received_delay: UInt64 = 0
+    ) {
+
+        self.send_result = send_result
+        self.send_delay = send_delay
+        self.receive_result = receive_result
+        self.received_delay = received_delay
+    }
+
+    func send(data: Data) async throws {
+        if send_delay > 0 {
+            try await Task.sleep(nanoseconds: send_delay)
+        }
+        try send_result.get()
+    }
+
+    func receive() async throws -> Data {
+        if received_delay > 0 {
+            try await Task.sleep(nanoseconds: received_delay)
+        }
+        return try receive_result.get()
+    }
+}
+
+@Test func network_interface_send_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        send_result: .failure(GeneralError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) { try await tester.test() }
+}
+
+@Test func network_interface_receive_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        receive_result: .failure(GeneralError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) { try await tester.test() }
+}
+
+@Test func network_interface_receive_wrong_data() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data()), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) { try await tester.test() }
+}
+
+@Test func network_interface_receive_wrong_data2() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data([1, 2, 3, 5])), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) { try await tester.test() }
+}
+
+@Test func network_relay_test() async throws {
+    let mirror = NetworkMirror()
+    let tester = NetworkInterfaceTester(interface: mirror)
+    try await tester.testRelay(data: Data([1, 2, 3, 4]))
+}
+
+@Test func network_relay_send_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        send_result: .failure(GeneralError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        receive_result: .failure(GeneralError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_wrong_data() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data()), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_wrong_data2() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data([1, 2, 3, 5])), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: GeneralError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func testConformances() async throws {
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
+
+    // 1. InstanceId
+    let id1 = InstanceId.fromEntropy()
+    let data1 = try encoder.encode(id1)
+    let id2 = try decoder.decode(InstanceId.self, from: data1)
+    #expect(id1 == id2)
+    #expect(id1.hashValue == id2.hashValue)
+    #expect(id1.id == id1.toBytes())
+
+    // 2. DeviceInfo & NodeVerifyingKey
+    let sk = NodeSecretKey.fromEntropy()
+    let vk1 = NodeVerifyingKey.fromSk(sk: sk)
+
+    // Test NodeVerifyingKey Codable
+    let vkData = try encoder.encode(vk1)
+    let vk2 = try decoder.decode(NodeVerifyingKey.self, from: vkData)
+    #expect(vk1 == vk2)
+    #expect(vk1.hashValue == vk2.hashValue)
+
+    let infoA = DeviceInfo.forVk(friendlyName: "DeviceA", vk: vk1)
+    let infoData = try encoder.encode(infoA)
+    let infoB = try decoder.decode(DeviceInfo.self, from: infoData)
+    #expect(infoA == infoB)
+    #expect(infoA.hashValue == infoB.hashValue)
+    #expect(infoA.id == vk1)
+
+    // 3. QrData
+    let qr1 = QrData(instance: id1, threshold: 3, deviceIndex: 1, vk: vk1)
+    let qrData = try encoder.encode(qr1)
+    let qr2 = try decoder.decode(QrData.self, from: qrData)
+    #expect(qr1 == qr2)
+    #expect(qr1.hashValue == qr2.hashValue)
+    #expect(qr1.id == qr1.toBytes())
+
+    // 4. DeviceLocalData
+    let data = genLocalData(t: 2, n: 3)
+    let node1Data = data[0]
+    let localDataBytes = try encoder.encode(node1Data)
+    let node1DataClone = try decoder.decode(DeviceLocalData.self, from: localDataBytes)
+    #expect(node1Data == node1DataClone)
+    #expect(node1Data.hashValue == node1DataClone.hashValue)
+}
